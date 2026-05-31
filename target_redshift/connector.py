@@ -148,29 +148,48 @@ class RedshiftConnector(SQLConnector):
         self.logger.info("[perf] prepare_table: table_exists check done in %.2fs (exists=%s)", time.time() - t0, table_already_exists)
 
         if table_already_exists:
+            # Build Table from the Singer schema already in memory — no autoload_with reflection.
+            table = Table(
+                table_name,
+                meta,
+                *[
+                    Column(
+                        prop_name,
+                        self.to_sql_type(prop_def),
+                        primary_key=prop_name in (primary_keys or []),
+                        autoincrement=False,
+                    )
+                    for prop_name, prop_def in schema["properties"].items()
+                ],
+            )
+            self.logger.info("[perf] prepare_table: built table from Singer schema (skipped reflection)")
+
+            # One fast pg_attribute query to detect columns that need to be added.
             t1 = time.time()
-            table = self.get_table(full_table_name=full_table_name)
-            self.logger.info("[perf] prepare_table: get_table (reflection) done in %.2fs", time.time() - t1)
-            columns = {column.name: column for column in table.columns}
-            props = list(schema["properties"].items())
-            self.logger.info("[perf] prepare_table: starting prepare_column loop for %d properties", len(props))
-            t_loop = time.time()
-            for property_name, property_def in props:
-                column_object = None
-                if property_name in columns:
-                    column_object = columns[property_name]
-                t_col = time.time()
-                self.prepare_column(
-                    full_table_name=table.fullname,
-                    column_name=property_name,
-                    sql_type=self.to_sql_type(property_def),
-                    cursor=cursor,
-                    column_object=column_object,
-                )
-                elapsed_col = time.time() - t_col
-                if elapsed_col > 0.5:
-                    self.logger.info("[perf] prepare_column '%s' took %.2fs", property_name, elapsed_col)
-            self.logger.info("[perf] prepare_table: prepare_column loop done in %.2fs", time.time() - t_loop)
+            cursor.execute(
+                "SELECT attname FROM pg_attribute a "
+                "JOIN pg_class c ON c.oid = a.attrelid "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped",
+                (schema_name, table_name),
+            )
+            existing_columns = {row[0] for row in cursor.fetchall()}
+            self.logger.info(
+                "[perf] prepare_table: pg_attribute fetch done in %.2fs (%d existing columns)",
+                time.time() - t1,
+                len(existing_columns),
+            )
+
+            new_columns = [(p, d) for p, d in schema["properties"].items() if p not in existing_columns]
+            if new_columns:
+                self.logger.info("[perf] prepare_table: adding %d new columns", len(new_columns))
+                for prop_name, prop_def in new_columns:
+                    self._create_empty_column(
+                        full_table_name=full_table_name,
+                        column_name=prop_name,
+                        sql_type=self.to_sql_type(prop_def),
+                        cursor=cursor,
+                    )
         else:
             t1 = time.time()
             table = self.create_empty_table(
