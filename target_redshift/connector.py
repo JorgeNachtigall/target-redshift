@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import typing as t
 from contextlib import contextmanager
 from typing import cast
@@ -42,9 +43,13 @@ class RedshiftConnector(SQLConnector):
             schema_name: The target schema name.
             cursor: The database cursor.
         """
+        t0 = time.time()
         schema_exists = self.schema_exists(schema_name)
+        self.logger.info("[perf] prepare_schema: schema_exists check done in %.2fs (exists=%s)", time.time() - t0, schema_exists)
         if not schema_exists:
+            t1 = time.time()
             self.create_schema(schema_name, cursor=cursor)
+            self.logger.info("[perf] prepare_schema: CREATE SCHEMA done in %.2fs", time.time() - t1)
 
     def grant_privileges(self, schema_name: str, cursor: Cursor) -> None:
         """Grant privileges to the target schema.
@@ -54,12 +59,14 @@ class RedshiftConnector(SQLConnector):
             cursor: The database cursor.
         """
         for grantee in self.config.get("grants", []):
+            t0 = time.time()
             cursor.execute(f"grant usage on schema {schema_name} to {grantee};")
             cursor.execute(f"grant select on all tables in schema {schema_name} to {grantee};")
             cursor.execute(
                 f"alter default privileges for user {self.config['user']} "
                 f"in schema {schema_name} grant select on tables to {grantee};"
             )
+            self.logger.info("[perf] grant_privileges: grants for '%s' done in %.2fs", grantee, time.time() - t0)
 
     def create_schema(self, schema_name: str, cursor: Cursor) -> None:
         """Create target schema.
@@ -85,6 +92,8 @@ class RedshiftConnector(SQLConnector):
             A redshift connector cursor.
         """
         user, password = self.get_credentials()
+        t0 = time.time()
+        self.logger.info("[perf] connect_cursor: opening TCP connection to Redshift at %s:%s", self.config["host"], self.config["port"])
         with redshift_connector.connect(
             user=user,
             password=password,
@@ -94,9 +103,12 @@ class RedshiftConnector(SQLConnector):
             ssl=self.config["ssl_enable"],
             sslmode=self.config["ssl_mode"],
         ) as connection:
+            self.logger.info("[perf] connect_cursor: connected in %.2fs", time.time() - t0)
             with connection.cursor() as cursor:
                 yield cursor
+            t1 = time.time()
             connection.commit()
+            self.logger.info("[perf] connect_cursor: commit done in %.2fs", time.time() - t1)
 
     def prepare_table(  # type: ignore[override]  # noqa: D417, PLR0913
         self,
@@ -123,8 +135,14 @@ class RedshiftConnector(SQLConnector):
 
         table: Table
 
-        if self.table_exists(full_table_name=full_table_name):
+        t0 = time.time()
+        table_already_exists = self.table_exists(full_table_name=full_table_name)
+        self.logger.info("[perf] prepare_table: table_exists check done in %.2fs (exists=%s)", time.time() - t0, table_already_exists)
+
+        if table_already_exists:
+            t1 = time.time()
             table = self.get_table(full_table_name=full_table_name)
+            self.logger.info("[perf] prepare_table: get_table (reflection) done in %.2fs", time.time() - t1)
             columns = {column.name: column for column in table.columns}
             for property_name, property_def in schema["properties"].items():
                 column_object = None
@@ -138,6 +156,7 @@ class RedshiftConnector(SQLConnector):
                     column_object=column_object,
                 )
         else:
+            t1 = time.time()
             table = self.create_empty_table(
                 table_name=table_name,
                 meta=meta,
@@ -146,6 +165,7 @@ class RedshiftConnector(SQLConnector):
                 as_temp_table=as_temp_table,
                 cursor=cursor,
             )
+            self.logger.info("[perf] prepare_table: CREATE TABLE done in %.2fs", time.time() - t1)
 
         return table
 
@@ -164,11 +184,15 @@ class RedshiftConnector(SQLConnector):
         """
         _, schema_name, table_name = self.parse_full_table_name(full_table_name)
         meta = MetaData(schema=schema_name)
-        return Table(
+        t0 = time.time()
+        self.logger.info("[perf] get_table: starting SQLAlchemy reflection for '%s'", full_table_name)
+        result = Table(
             table_name,
             meta,
             autoload_with=self._engine,
         )
+        self.logger.info("[perf] get_table: reflection done in %.2fs", time.time() - t0)
+        return result
 
     def copy_table_structure(
         self,
@@ -202,7 +226,9 @@ class RedshiftConnector(SQLConnector):
             new_table = Table(table_name, meta, *columns)
 
         create_table_ddl = str(CreateTable(new_table).compile(dialect=self._engine.dialect))
+        t0 = time.time()
         cursor.execute(create_table_ddl)
+        self.logger.info("[perf] copy_table_structure: CREATE TEMP TABLE done in %.2fs", time.time() - t0)
         return new_table
 
     def drop_table(self, table: Table, cursor: Cursor) -> None:
@@ -497,6 +523,8 @@ class RedshiftConnector(SQLConnector):
         Args:
             config: The configuration for the connector.
         """
+        t0 = time.time()
+        self.logger.info("[perf] get_sqlalchemy_url: building SQLAlchemy engine URL")
         user, password = self.get_credentials()
         sqlalchemy_url = URL.create(
             drivername="redshift+redshift_connector",
@@ -507,6 +535,7 @@ class RedshiftConnector(SQLConnector):
             database=config["dbname"],
             query=self.get_sqlalchemy_query(config),
         )
+        self.logger.info("[perf] get_sqlalchemy_url: done in %.2fs", time.time() - t0)
         return cast(str, sqlalchemy_url)
 
     def get_sqlalchemy_query(self, config: dict) -> dict:
@@ -535,6 +564,8 @@ class RedshiftConnector(SQLConnector):
             username and password
         """
         if self.config.get("enable_iam_authentication"):
+            t0 = time.time()
+            self.logger.info("[perf] get_credentials: fetching IAM cluster credentials")
             client = boto3.client("redshift", region_name="eu-west-1")
             response = client.get_cluster_credentials(
                 DbUser=self.config["user"],
@@ -543,5 +574,6 @@ class RedshiftConnector(SQLConnector):
                 DurationSeconds=3600,
                 AutoCreate=False,
             )
+            self.logger.info("[perf] get_credentials: IAM credentials fetched in %.2fs", time.time() - t0)
             return response["DbUser"], response["DbPassword"]
         return self.config["user"], self.config["password"]
