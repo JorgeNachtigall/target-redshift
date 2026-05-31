@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 import os
-import time
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
@@ -84,23 +83,13 @@ class RedshiftSink(SQLSink):
         This method is called on Sink creation, and creates the required Schema and
         Table entities in the target database.
         """
-        t0 = time.time()
-        self.logger.info("[perf] setup() started for stream '%s'", self.stream_name)
         if self.key_properties is None or self.key_properties == []:
             self.append_only = True
         else:
             self.append_only = False
-        t1 = time.time()
-        self.logger.info("[perf] setup: opening Redshift connection")
         with self.connector.connect_cursor() as cursor:
-            self.logger.info("[perf] setup: connection opened in %.2fs", time.time() - t1)
             if self.schema_name:
-                t2 = time.time()
-                self.logger.info("[perf] setup: preparing schema '%s'", self.schema_name)
                 self.connector.prepare_schema(self.schema_name, cursor=cursor)
-                self.logger.info("[perf] setup: prepare_schema done in %.2fs", time.time() - t2)
-            t3 = time.time()
-            self.logger.info("[perf] setup: preparing table '%s'", self.full_table_name)
             self._cached_table = self.connector.prepare_table(
                 full_table_name=self.full_table_name,
                 schema=self.conformed_schema,
@@ -108,11 +97,7 @@ class RedshiftSink(SQLSink):
                 cursor=cursor,
                 as_temp_table=False,
             )
-            self.logger.info("[perf] setup: prepare_table done in %.2fs", time.time() - t3)
-            t4 = time.time()
             self.connector.grant_privileges(self.schema_name, cursor=cursor)
-            self.logger.info("[perf] setup: grant_privileges done in %.2fs", time.time() - t4)
-        self.logger.info("[perf] setup() completed in %.2fs", time.time() - t0)
 
     def generate_temp_table_name(self) -> str:
         """Uuid temp table name."""
@@ -132,52 +117,34 @@ class RedshiftSink(SQLSink):
         Args:
             context: Stream partition or context dictionary.
         """
-        t0 = time.time()
-        self.logger.info(
-            "[perf] process_batch() started for stream '%s' (%d records)",
-            self.stream_name,
-            len(context["records"]),
-        )
         # If duplicates are merged, these can be tracked via
         # :meth:`~singer_sdk.Sink.tally_duplicate_merged()`.
-        t1 = time.time()
-        self.logger.info("[perf] process_batch: opening Redshift connection")
         with self.connector.connect_cursor() as cursor:
-            self.logger.info("[perf] process_batch: connection opened in %.2fs", time.time() - t1)
             # Get target table (reuse reflection from setup() — no per-batch round-trip to Redshift)
             table: sqlalchemy.Table = self._cached_table
             # Create a temp table (Creates from the table above)
-            t3 = time.time()
             temp_table: sqlalchemy.Table = self.connector.copy_table_structure(
                 full_table_name=self.temp_table_name,
                 from_table=table,
                 as_temp_table=True,
                 cursor=cursor,
             )
-            self.logger.info("[perf] process_batch: copy_table_structure done in %.2fs", time.time() - t3)
             # Insert into temp table
-            t4 = time.time()
             self.bulk_insert_records(
                 table=temp_table,
                 records=context["records"],
                 cursor=cursor,
             )
-            self.logger.info("[perf] process_batch: bulk_insert_records done in %.2fs", time.time() - t4)
             self.logger.info(f'merging {len(context["records"])} records into {table}')  # noqa: G004
             # Merge data from temp table to main table
-            t5 = time.time()
             self.upsert(
                 from_table=temp_table,
                 to_table=table,
                 join_keys=self.key_properties,
                 cursor=cursor,
             )
-            self.logger.info("[perf] process_batch: upsert done in %.2fs", time.time() - t5)
             # clean_resources
-        t6 = time.time()
         self.clean_resources()
-        self.logger.info("[perf] process_batch: clean_resources done in %.2fs", time.time() - t6)
-        self.logger.info("[perf] process_batch() completed in %.2fs", time.time() - t0)
 
     def s3_uri(self) -> str:
         """Return the s3 uri.
@@ -263,10 +230,7 @@ class RedshiftSink(SQLSink):
                 INSERT INTO {self.connector.quote(str(to_table))}
                 SELECT * FROM {self.connector.quote(str(from_table))}
                 """  # noqa: S608
-        t0 = time.time()
-        self.logger.info("[perf] upsert: executing %s into '%s'", "MERGE" if join_keys else "INSERT", str(to_table))
         cursor.execute(sql)
-        self.logger.info("[perf] upsert: done in %.2fs", time.time() - t0)
 
     def format_records_as_csv(self, records: Iterable[dict[str, Any]]) -> list[dict]:
         """Write records to a local csv file.
@@ -303,14 +267,11 @@ class RedshiftSink(SQLSink):
 
     def write_to_s3(self, records: Iterable[dict[str, Any]]) -> None:
         """Write the csv file to s3."""
-        t0 = time.time()
         records = self.format_records_as_csv(records)
-        self.logger.info("[perf] write_to_s3: format_records_as_csv done in %.2fs", time.time() - t0)
         keys: list[str] = list(self.conformed_schema["properties"].keys())
 
         self.logger.info("writing %d records to %s", len(records), self.s3_uri())
 
-        t1 = time.time()
         with smart_open.open(self.s3_uri(), "w") as fp:
             writer = csv.DictWriter(
                 fp,
@@ -319,7 +280,6 @@ class RedshiftSink(SQLSink):
                 dialect="excel",
             )
             writer.writerows(records)
-        self.logger.info("[perf] write_to_s3: S3 upload done in %.2fs", time.time() - t1)
 
     def copy_to_redshift(self, table: sqlalchemy.Table, cursor: Cursor) -> None:
         """Copy the s3 csv file to redshift."""
@@ -344,10 +304,7 @@ class RedshiftSink(SQLSink):
             GZIP
             CSV
         """
-        t0 = time.time()
-        self.logger.info("[perf] copy_to_redshift: executing COPY command into '%s'", str(table))
         cursor.execute(copy_sql)
-        self.logger.info("[perf] copy_to_redshift: COPY done in %.2fs", time.time() - t0)
 
     def parse_timestamps_in_record(
         self,
