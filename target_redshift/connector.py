@@ -144,10 +144,14 @@ class RedshiftConnector(SQLConnector):
             table = self.get_table(full_table_name=full_table_name)
             self.logger.info("[perf] prepare_table: get_table (reflection) done in %.2fs", time.time() - t1)
             columns = {column.name: column for column in table.columns}
-            for property_name, property_def in schema["properties"].items():
+            props = list(schema["properties"].items())
+            self.logger.info("[perf] prepare_table: starting prepare_column loop for %d properties", len(props))
+            t_loop = time.time()
+            for property_name, property_def in props:
                 column_object = None
                 if property_name in columns:
                     column_object = columns[property_name]
+                t_col = time.time()
                 self.prepare_column(
                     full_table_name=table.fullname,
                     column_name=property_name,
@@ -155,6 +159,10 @@ class RedshiftConnector(SQLConnector):
                     cursor=cursor,
                     column_object=column_object,
                 )
+                elapsed_col = time.time() - t_col
+                if elapsed_col > 0.5:
+                    self.logger.info("[perf] prepare_column '%s' took %.2fs", property_name, elapsed_col)
+            self.logger.info("[perf] prepare_table: prepare_column loop done in %.2fs", time.time() - t_loop)
         else:
             t1 = time.time()
             table = self.create_empty_table(
