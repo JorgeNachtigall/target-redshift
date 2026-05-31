@@ -360,12 +360,9 @@ class RedshiftConnector(SQLConnector):
             )
             return
 
-        self._adapt_column_type(
-            full_table_name=full_table_name,
-            column_name=column_name,
-            sql_type=sql_type,
-            cursor=cursor,
-        )
+        # allow_column_alter = False, so _adapt_column_type can never change anything —
+        # it either returns early or raises NotImplementedError. Skipping it avoids one
+        # information_schema round-trip to Redshift per column (very expensive at scale).
 
     def _create_empty_column(
         self,
