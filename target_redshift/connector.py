@@ -44,7 +44,9 @@ class RedshiftConnector(SQLConnector):
             cursor: The database cursor.
         """
         t0 = time.time()
-        schema_exists = self.schema_exists(schema_name)
+        # Use pg_namespace directly (open cursor, no new connection, faster than information_schema).
+        cursor.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (schema_name,))
+        schema_exists = cursor.fetchone() is not None
         self.logger.info("[perf] prepare_schema: schema_exists check done in %.2fs (exists=%s)", time.time() - t0, schema_exists)
         if not schema_exists:
             t1 = time.time()
@@ -136,7 +138,13 @@ class RedshiftConnector(SQLConnector):
         table: Table
 
         t0 = time.time()
-        table_already_exists = self.table_exists(full_table_name=full_table_name)
+        # Use pg_class directly (open cursor, no new connection, faster than information_schema).
+        cursor.execute(
+            "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname = %s AND c.relkind = 'r'",
+            (schema_name, table_name),
+        )
+        table_already_exists = cursor.fetchone() is not None
         self.logger.info("[perf] prepare_table: table_exists check done in %.2fs (exists=%s)", time.time() - t0, table_already_exists)
 
         if table_already_exists:
@@ -224,9 +232,8 @@ class RedshiftConnector(SQLConnector):
         _, schema_name, table_name = self.parse_full_table_name(full_table_name)
         meta = MetaData(schema=schema_name)
         new_table: Table
-        if self.table_exists(full_table_name=full_table_name):
-            msg = "Table already exists"
-            raise RuntimeError(msg)
+        # Temp table names are UUIDs generated fresh per sink instance — they can never
+        # already exist, so skip the expensive table_exists (SQLAlchemy engine inspection).
         columns = [column._copy() for column in from_table.columns]  # noqa: SLF001
         if as_temp_table:
             new_table = Table(table_name, meta, *columns, prefixes=["TEMPORARY"])

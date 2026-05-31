@@ -101,7 +101,7 @@ class RedshiftSink(SQLSink):
                 self.logger.info("[perf] setup: prepare_schema done in %.2fs", time.time() - t2)
             t3 = time.time()
             self.logger.info("[perf] setup: preparing table '%s'", self.full_table_name)
-            self.connector.prepare_table(
+            self._cached_table = self.connector.prepare_table(
                 full_table_name=self.full_table_name,
                 schema=self.conformed_schema,
                 primary_keys=self.key_properties,
@@ -144,11 +144,8 @@ class RedshiftSink(SQLSink):
         self.logger.info("[perf] process_batch: opening Redshift connection")
         with self.connector.connect_cursor() as cursor:
             self.logger.info("[perf] process_batch: connection opened in %.2fs", time.time() - t1)
-            # Get target table
-            t2 = time.time()
-            self.logger.info("[perf] process_batch: reflecting table '%s'", self.full_table_name)
-            table: sqlalchemy.Table = self.connector.get_table(full_table_name=self.full_table_name)
-            self.logger.info("[perf] process_batch: get_table done in %.2fs", time.time() - t2)
+            # Get target table (reuse reflection from setup() — no per-batch round-trip to Redshift)
+            table: sqlalchemy.Table = self._cached_table
             # Create a temp table (Creates from the table above)
             t3 = time.time()
             temp_table: sqlalchemy.Table = self.connector.copy_table_structure(
