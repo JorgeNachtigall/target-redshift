@@ -210,27 +210,101 @@ class RedshiftSink(SQLSink):
             report number of records affected/inserted.
 
         """
-        join_predicates = []
-        to_table_key: sqlalchemy.Column
-        for key in join_keys:
-            from_table_key: sqlalchemy.Column = from_table.columns[key]
-            to_table_key = to_table.columns[key]
-            join_predicates.append(from_table_key == to_table_key)
+        target = self.connector.quote(str(to_table))
+        source = self.connector.quote(str(from_table))
+        columns = [column.name for column in from_table.columns]
 
-        join_condition = sqlalchemy.and_(*join_predicates)
-        if len(join_keys) > 0:
+        if len(join_keys) == 0:
+            # Name-based INSERT. `SELECT *` would pair columns by ordinal position,
+            # which breaks as soon as the target's physical order drifts from the
+            # catalog order the staging table is built in.
+            column_list = ", ".join(self.connector.quote(column) for column in columns)
             sql = f"""
-                MERGE INTO {self.connector.quote(str(to_table))}
-                USING {self.connector.quote(str(from_table))}
-                ON {join_condition}
-                REMOVE DUPLICATES
-                """
-        else:
-            sql = f"""
-                INSERT INTO {self.connector.quote(str(to_table))}
-                SELECT * FROM {self.connector.quote(str(from_table))}
+                INSERT INTO {target} ({column_list})
+                SELECT {column_list} FROM {source}
                 """  # noqa: S608
+            cursor.execute(sql)
+            return
+
+        sql = self.build_merge_sql(
+            target=target,
+            source=source,
+            columns=columns,
+            join_keys=list(join_keys),
+        )
         cursor.execute(sql)
+
+    def build_merge_sql(
+        self,
+        target: str,
+        source: str,
+        columns: list[str],
+        join_keys: list[str],
+    ) -> str:
+        """Build a name-based MERGE statement.
+
+        Redshift's simplified ``MERGE ... REMOVE DUPLICATES`` form pairs source and
+        target columns by *ordinal position*. The staging table is built in Singer
+        catalog order, while columns added later via ``ALTER TABLE ... ADD COLUMN``
+        are appended to the end of the target's physical layout. Once those two
+        orderings diverge, a positional merge writes every column past the drift
+        point into its neighbour -- loudly when the types are incompatible, silently
+        when they happen to match.
+
+        Naming every column removes that coupling: physical order stops mattering.
+
+        Args:
+            target: Quoted, fully-qualified target table name.
+            source: Quoted, fully-qualified staging table name.
+            columns: Column names, as present on both tables.
+            join_keys: Columns to match rows on.
+
+        Returns:
+            The MERGE statement.
+        """
+        quoted = {column: self.connector.quote(column) for column in columns}
+
+        # The explicit MERGE form has no `REMOVE DUPLICATES` equivalent, and Redshift
+        # errors if more than one source row matches the same target row. A stream can
+        # legitimately emit the same key twice in one batch (an insert plus a later
+        # update), so collapse duplicates in the USING subquery instead. Which row of a
+        # duplicate set survives is arbitrary -- as it was under REMOVE DUPLICATES.
+        partition_by = ", ".join(quoted[key] for key in join_keys)
+        select_list = ", ".join(quoted[column] for column in columns)
+        deduplicated = f"""
+                SELECT {select_list} FROM (
+                    SELECT {select_list},
+                           ROW_NUMBER() OVER (PARTITION BY {partition_by}
+                                              ORDER BY {partition_by}) AS __tr_row_num
+                    FROM {source}
+                ) AS __tr_ranked
+                WHERE __tr_row_num = 1
+        """  # noqa: S608
+
+        on_clause = " AND ".join(f"{target}.{quoted[key]} = __tr_src.{quoted[key]}" for key in join_keys)
+
+        # Join keys are equal by definition on a matched row, and Redshift rejects
+        # updates to columns used in the match condition, so they are set only on insert.
+        updatable = [column for column in columns if column not in set(join_keys)]
+
+        insert_columns = ", ".join(quoted[column] for column in columns)
+        insert_values = ", ".join(f"__tr_src.{quoted[column]}" for column in columns)
+
+        clauses = []
+        if updatable:
+            # A table that is *only* join keys has nothing to update; emitting an empty
+            # SET list would be a syntax error, and skipping the clause is equivalent.
+            update_clause = ", ".join(f"{quoted[column]} = __tr_src.{quoted[column]}" for column in updatable)
+            clauses.append(f"WHEN MATCHED THEN UPDATE SET {update_clause}")
+        clauses.append(f"WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values})")
+        when_clauses = "\n            ".join(clauses)
+
+        return f"""
+            MERGE INTO {target}
+            USING ({deduplicated}) AS __tr_src
+            ON {on_clause}
+            {when_clauses}
+            """
 
     def format_records_as_csv(self, records: Iterable[dict[str, Any]]) -> list[dict]:
         """Write records to a local csv file.
