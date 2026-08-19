@@ -27,6 +27,7 @@ from singer_sdk.sinks import SQLSink
 from singer_sdk.typing import _jsonschema_type_check
 
 from target_redshift.connector import RedshiftConnector
+from target_redshift.identifiers import truncate_identifier
 
 if TYPE_CHECKING:
     from redshift_connector import Cursor
@@ -48,6 +49,23 @@ class RedshiftSink(SQLSink):
             self.s3_client = boto3.client("s3")
         else:
             self.s3_client = boto3.client("s3", region_name=region)
+
+    def conform_name(self, name: str, object_type: str | None = None) -> str:
+        """Conform a name to Redshift's naming rules.
+
+        Applies the base snake-case conformance, then enforces Redshift's identifier
+        length limit. Every column name in this target flows through here -- the
+        schema used for DDL, the CSV header, the COPY column list and the record
+        keys -- so truncating in this one place keeps them all consistent.
+
+        Args:
+            name: Property name.
+            object_type: One of ``database``, ``schema``, ``table`` or ``column``.
+
+        Returns:
+            The conformed, length-limited name.
+        """
+        return truncate_identifier(super().conform_name(name, object_type))
 
     @property
     def schema_name(self) -> str | None:
