@@ -43,6 +43,9 @@ class RedshiftSink(SQLSink):
         """Initialize SQL Sink. See super class for more details."""
         super().__init__(*args, **kwargs)
         self.temp_table_name = self.generate_temp_table_name()
+        # load_method=overwrite: the target table is emptied once per run, by the
+        # first batch, in the same transaction as that batch's insert.
+        self._overwrite_pending = self.config.get("load_method") == "overwrite"
 
         region = self.config.get("s3_region")
         if region is None:
@@ -153,6 +156,8 @@ class RedshiftSink(SQLSink):
                 records=context["records"],
                 cursor=cursor,
             )
+            if self._overwrite_pending:
+                self.clear_table(table=table, cursor=cursor)
             self.logger.info(f'merging {len(context["records"])} records into {table}')  # noqa: G004
             # Merge data from temp table to main table
             self.upsert(
@@ -206,6 +211,25 @@ class RedshiftSink(SQLSink):
         self.write_to_s3(records)
         self.copy_to_redshift(table, cursor)
         return True
+
+    def clear_table(self, table: sqlalchemy.Table, cursor: Cursor) -> None:
+        """Empty the target table for load_method=overwrite.
+
+        The SDK implements overwrite in its own prepare_table(), which this target
+        replaces, so without this the setting was silently ignored and every run
+        appended a full copy of the stream.
+
+        DELETE rather than DROP/TRUNCATE: it keeps the table's grants and any
+        views that depend on it, and unlike TRUNCATE (which commits implicitly on
+        Redshift) it shares the transaction with the first batch's insert, so
+        readers never see the table empty and a failed load leaves the old rows.
+
+        A stream that emits no records never reaches a batch, so its table keeps
+        the previous run's rows.
+        """
+        self.logger.info("load_method=overwrite: deleting existing rows from %s", table)
+        cursor.execute(f"DELETE FROM {self.connector.quote(str(table))}")  # noqa: S608
+        self._overwrite_pending = False
 
     def upsert(
         self,
